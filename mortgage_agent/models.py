@@ -1,4 +1,4 @@
-"""Data structures shared across the mortgage agent."""
+"""Data structures shared across the mortgage agent (Australian market)."""
 
 from __future__ import annotations
 
@@ -6,77 +6,87 @@ from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
 
-
-class LoanProgram(str, Enum):
-    """First-time home buyer friendly loan programs supported by the agent."""
-
-    CONVENTIONAL_97 = "conventional_97"
-    FHA = "fha"
-    VA = "va"
-    USDA = "usda"
+AU_STATES = {"NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT"}
 
 
-@dataclass(frozen=True)
-class RateQuote:
-    """A single mortgage rate data point."""
+class LoanScheme(str, Enum):
+    """A standard home loan plus the Australian Government's Home Guarantee Scheme products."""
 
-    program: str
-    term_years: int
-    rate_percent: float
-    as_of: date
-    source: str
+    STANDARD = "standard"
+    FIRST_HOME_GUARANTEE = "first_home_guarantee"
+    REGIONAL_FIRST_HOME_GUARANTEE = "regional_first_home_guarantee"
+    FAMILY_HOME_GUARANTEE = "family_home_guarantee"
 
 
 @dataclass
 class Applicant:
-    """Financial profile of a prospective first-time home buyer."""
+    """Financial profile of a prospective Australian first home buyer."""
 
-    annual_income: float
-    monthly_debts: float
-    credit_score: int
-    down_payment: float
+    annual_income: float  # gross; combined household income if is_couple
+    monthly_living_expenses: float
+    monthly_other_debts: float
+    deposit: float
     home_price: float
-    is_veteran: bool = False
-    is_rural_property: bool = False
-    household_size: int = 1
-    # Household income limit for the applicant's area, used for USDA's
-    # 115%-of-AMI test. If unknown, USDA eligibility is reported as
-    # "needs verification" rather than pass/fail.
-    area_median_income: float | None = None
-    annual_property_tax_rate: float = 0.011  # ~1.1% of home price/yr (US avg)
-    annual_insurance_rate: float = 0.0035  # ~0.35% of home price/yr
+    state: str
+    is_couple: bool = False
+    is_single_parent: bool = False
+    is_regional: bool = False
+    is_first_home_buyer: bool = True
+    is_owner_occupier: bool = True
+    is_australian_citizen_or_pr: bool = True
+    is_new_home: bool = False  # relevant to the First Home Owner Grant only
+    dependents: int = 0
 
-    @property
-    def monthly_income(self) -> float:
-        return self.annual_income / 12
+    def __post_init__(self) -> None:
+        state = self.state.upper()
+        if state not in AU_STATES:
+            raise ValueError(f"Unknown state '{self.state}'; expected one of {sorted(AU_STATES)}")
+        self.state = state
 
     @property
     def loan_amount(self) -> float:
-        return max(self.home_price - self.down_payment, 0.0)
+        return max(self.home_price - self.deposit, 0.0)
 
     @property
-    def down_payment_percent(self) -> float:
+    def lvr_percent(self) -> float:
         if self.home_price <= 0:
             return 0.0
-        return self.down_payment / self.home_price * 100
+        return self.loan_amount / self.home_price * 100
+
+    @property
+    def deposit_percent(self) -> float:
+        if self.home_price <= 0:
+            return 0.0
+        return self.deposit / self.home_price * 100
 
 
 @dataclass
-class ProgramResult:
-    """Eligibility outcome for a single loan program."""
+class SchemeResult:
+    """Eligibility outcome for a single loan scheme."""
 
-    program: LoanProgram
+    scheme: LoanScheme
     eligible: bool
-    needs_verification: bool
     reasons: list[str]
-    interest_rate_percent: float | None
+    interest_rate_percent: float
     loan_amount: float
-    down_payment_percent: float
-    monthly_principal_interest: float | None
-    monthly_piti: float | None
-    front_end_dti_percent: float | None
-    back_end_dti_percent: float | None
+    lvr_percent: float
+    requires_lmi: bool
+    estimated_lmi_premium: float | None
+    monthly_repayment: float | None  # principal & interest, at the actual rate
+    assessed_monthly_repayment: float | None  # principal & interest, at the APRA buffer rate
+    monthly_surplus_at_assessed_rate: float | None
+    loan_to_income_ratio: float | None
     max_affordable_home_price: float | None
+
+
+@dataclass
+class GrantEstimate:
+    """Indicative First Home Owner Grant outcome for a state."""
+
+    state: str
+    amount: float
+    eligible: bool
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -84,17 +94,24 @@ class AgentReport:
     """Full output of a MortgageEligibilityAgent run."""
 
     applicant: Applicant
-    rates_as_of: date
+    rate_as_of: date
     rate_source: str
-    results: list[ProgramResult] = field(default_factory=list)
+    cash_rate_percent: float
+    variable_rate_percent: float
+    fixed_3yr_rate_percent: float
+    results: list[SchemeResult] = field(default_factory=list)
+    estimated_fhog: GrantEstimate | None = None
 
     @property
-    def eligible_programs(self) -> list[ProgramResult]:
+    def eligible_schemes(self) -> list[SchemeResult]:
         return [r for r in self.results if r.eligible]
 
     @property
-    def best_program(self) -> ProgramResult | None:
-        candidates = [r for r in self.eligible_programs if r.monthly_piti is not None]
+    def best_scheme(self) -> SchemeResult | None:
+        candidates = [r for r in self.eligible_schemes if r.monthly_repayment is not None]
         if not candidates:
             return None
-        return min(candidates, key=lambda r: r.monthly_piti)
+        return min(
+            candidates,
+            key=lambda r: (r.requires_lmi, r.estimated_lmi_premium or 0.0, r.monthly_repayment),
+        )

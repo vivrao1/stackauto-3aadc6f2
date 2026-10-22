@@ -1,71 +1,76 @@
-"""First-time home buyer loan eligibility rules and affordability math.
+"""Australian first home buyer loan scheme eligibility and serviceability math.
 
-Program thresholds (minimum credit score, minimum down payment, max DTI)
-reflect commonly published agency guidelines (HUD/FHA handbook, Fannie
-Mae Conventional 97, VA lending guidelines, USDA Rural Development). Actual
-lender overlays vary; treat results as an estimate, not a loan commitment.
+Scheme thresholds (income caps, property price caps, max LVR) reflect the
+Australian Government's Home Guarantee Scheme (First Home Guarantee,
+Regional First Home Buyer Guarantee, Family Home Guarantee) as
+administered by Housing Australia. These caps are reviewed periodically
+by government and WILL change -- POLICY_SNAPSHOT_DATE records when these
+figures were last checked; verify current settings at
+housingaustralia.gov.au before relying on this for a real purchase.
+
+Serviceability uses APRA's mandated minimum interest rate buffer (current
+rate + 3 percentage points) applied to standard loan amortization. This
+mirrors, but simplifies, the bank-specific calculators lenders actually
+use, which also apply the HEM living-expense benchmark and proprietary
+risk scoring.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from datetime import date
 
-from mortgage_agent.models import Applicant, LoanProgram, ProgramResult
+from mortgage_agent.models import Applicant, LoanScheme, SchemeResult
 from mortgage_agent.rates import RateSnapshot
+from mortgage_agent.tax import estimate_net_monthly_income
 
+POLICY_SNAPSHOT_DATE = date(2025, 7, 1)
 
-@dataclass(frozen=True)
-class ProgramRules:
-    program: LoanProgram
-    min_credit_score: int
-    min_down_payment_percent: float
-    max_front_end_dti_percent: float
-    max_back_end_dti_percent: float
-    requires_veteran: bool = False
-    requires_rural: bool = False
-    requires_income_limit_check: bool = False
+APRA_SERVICEABILITY_BUFFER_PERCENT = 3.0
+HIGH_LOAN_TO_INCOME_RATIO = 6.0
 
+# Household income caps for the Home Guarantee Scheme (annual, gross).
+FHBG_INCOME_CAP_SINGLE = 125_000
+FHBG_INCOME_CAP_COUPLE = 200_000
+FAMILY_HOME_INCOME_CAP = 125_000  # single parent / legal guardian applicants only
 
-PROGRAM_RULES: dict[LoanProgram, ProgramRules] = {
-    LoanProgram.CONVENTIONAL_97: ProgramRules(
-        program=LoanProgram.CONVENTIONAL_97,
-        min_credit_score=620,
-        min_down_payment_percent=3.0,
-        max_front_end_dti_percent=36.0,
-        max_back_end_dti_percent=45.0,
-    ),
-    LoanProgram.FHA: ProgramRules(
-        program=LoanProgram.FHA,
-        min_credit_score=580,
-        min_down_payment_percent=3.5,
-        max_front_end_dti_percent=31.0,
-        max_back_end_dti_percent=43.0,
-    ),
-    LoanProgram.VA: ProgramRules(
-        program=LoanProgram.VA,
-        min_credit_score=580,
-        min_down_payment_percent=0.0,
-        max_front_end_dti_percent=100.0,  # VA has no fixed front-end cap
-        max_back_end_dti_percent=41.0,
-        requires_veteran=True,
-    ),
-    LoanProgram.USDA: ProgramRules(
-        program=LoanProgram.USDA,
-        min_credit_score=640,
-        min_down_payment_percent=0.0,
-        max_front_end_dti_percent=29.0,
-        max_back_end_dti_percent=41.0,
-        requires_rural=True,
-        requires_income_limit_check=True,
-    ),
+MAX_LVR_STANDARD = 95.0
+MAX_LVR_GUARANTEE = 95.0
+MAX_LVR_FAMILY_HOME_GUARANTEE = 98.0
+
+# Indicative property price caps ($AUD) under the Home Guarantee Scheme,
+# split by capital city vs. rest-of-state. Must be checked against the
+# current Housing Australia caps for the applicant's specific region.
+PRICE_CAPS = {
+    "NSW": {"capital": 900_000, "regional": 750_000},
+    "VIC": {"capital": 800_000, "regional": 650_000},
+    "QLD": {"capital": 700_000, "regional": 550_000},
+    "WA": {"capital": 600_000, "regional": 450_000},
+    "SA": {"capital": 600_000, "regional": 450_000},
+    "TAS": {"capital": 600_000, "regional": 450_000},
+    "ACT": {"capital": 750_000, "regional": 750_000},
+    "NT": {"capital": 600_000, "regional": 600_000},
 }
 
-# FHA allows a lower down payment (10%) with credit scores between 500-579.
-FHA_LOW_SCORE_MIN = 500
-FHA_LOW_SCORE_MIN_DOWN_PERCENT = 10.0
+# Rough LMI premium as a percentage of the loan amount, by LVR band.
+# Actual premiums vary by lender, insurer, and loan size.
+LMI_PREMIUM_BANDS = [  # (max LVR inclusive, premium % of loan)
+    (85.0, 1.0),
+    (90.0, 1.8),
+    (95.0, 3.5),
+    (100.0, 4.5),
+]
 
-# USDA's income limit is 115% of the area median income for the household size.
-USDA_INCOME_LIMIT_MULTIPLIER = 1.15
+
+def price_cap_for(state: str, is_regional: bool) -> float:
+    caps = PRICE_CAPS[state]
+    return caps["regional"] if is_regional else caps["capital"]
+
+
+def estimate_lmi_premium(loan_amount: float, lvr_percent: float) -> float:
+    for max_lvr, premium_percent in LMI_PREMIUM_BANDS:
+        if lvr_percent <= max_lvr:
+            return loan_amount * premium_percent / 100
+    return loan_amount * LMI_PREMIUM_BANDS[-1][1] / 100
 
 
 def monthly_principal_and_interest(loan_amount: float, annual_rate_percent: float, term_years: int = 30) -> float:
@@ -92,124 +97,121 @@ def max_loan_for_payment(max_monthly_payment: float, annual_rate_percent: float,
     return max_monthly_payment * (factor - 1) / (monthly_rate * factor)
 
 
-def evaluate_program(applicant: Applicant, snapshot: RateSnapshot, program: LoanProgram) -> ProgramResult:
-    rules = PROGRAM_RULES[program]
+def evaluate_scheme(applicant: Applicant, snapshot: RateSnapshot, scheme: LoanScheme) -> SchemeResult:
     reasons: list[str] = []
-    needs_verification = False
-
-    min_down_percent = rules.min_down_payment_percent
-    if program == LoanProgram.FHA and FHA_LOW_SCORE_MIN <= applicant.credit_score < 580:
-        min_down_percent = FHA_LOW_SCORE_MIN_DOWN_PERCENT
-
     eligible = True
 
-    if rules.requires_veteran and not applicant.is_veteran:
-        eligible = False
-        reasons.append("VA loans require eligible veteran, service member, or surviving spouse status.")
-
-    if rules.requires_rural and not applicant.is_rural_property:
-        eligible = False
-        reasons.append("USDA loans require the property to be in an eligible rural area.")
-
-    min_score = FHA_LOW_SCORE_MIN if program == LoanProgram.FHA else rules.min_credit_score
-    if applicant.credit_score < min_score:
-        eligible = False
-        reasons.append(
-            f"Credit score {applicant.credit_score} is below the program minimum of {min_score}."
-        )
-    elif applicant.credit_score < rules.min_credit_score:
-        reasons.append(
-            f"Credit score {applicant.credit_score} qualifies only with a higher "
-            f"{min_down_percent:.1f}% down payment."
-        )
-
-    if applicant.down_payment_percent < min_down_percent - 1e-9:
-        eligible = False
-        reasons.append(
-            f"Down payment of {applicant.down_payment_percent:.1f}% is below the "
-            f"required {min_down_percent:.1f}%."
-        )
-
-    if rules.requires_income_limit_check:
-        needs_verification = True
-        if applicant.area_median_income is not None:
-            limit = applicant.area_median_income * USDA_INCOME_LIMIT_MULTIPLIER
-            if applicant.annual_income > limit:
-                eligible = False
-                needs_verification = False
-                reasons.append(
-                    f"Household income {applicant.annual_income:,.0f} exceeds the USDA limit of "
-                    f"115% of area median income ({limit:,.0f})."
-                )
-            else:
-                needs_verification = False
-        else:
-            reasons.append(
-                "USDA eligibility also requires household income at or below 115% of the "
-                "area median income; provide area_median_income to verify."
-            )
-
-    interest_rate = snapshot.program_rate(program.value)
+    rate = snapshot.variable_rate_percent
     loan_amount = applicant.loan_amount
-    monthly_pi = monthly_principal_and_interest(loan_amount, interest_rate) if loan_amount > 0 else 0.0
-    monthly_tax = applicant.home_price * applicant.annual_property_tax_rate / 12
-    monthly_insurance = applicant.home_price * applicant.annual_insurance_rate / 12
-    monthly_piti = monthly_pi + monthly_tax + monthly_insurance
+    lvr = applicant.lvr_percent
 
-    front_end_dti = back_end_dti = None
-    max_affordable_home_price = None
-    if applicant.monthly_income > 0:
-        front_end_dti = monthly_piti / applicant.monthly_income * 100
-        back_end_dti = (monthly_piti + applicant.monthly_debts) / applicant.monthly_income * 100
+    if scheme == LoanScheme.FAMILY_HOME_GUARANTEE:
+        max_lvr = MAX_LVR_FAMILY_HOME_GUARANTEE
+    elif scheme in (LoanScheme.FIRST_HOME_GUARANTEE, LoanScheme.REGIONAL_FIRST_HOME_GUARANTEE):
+        max_lvr = MAX_LVR_GUARANTEE
+    else:
+        max_lvr = MAX_LVR_STANDARD
 
-        if front_end_dti > rules.max_front_end_dti_percent + 1e-9:
-            eligible = False
-            reasons.append(
-                f"Housing-expense ratio {front_end_dti:.1f}% exceeds the program's "
-                f"{rules.max_front_end_dti_percent:.1f}% limit."
-            )
-        if back_end_dti > rules.max_back_end_dti_percent + 1e-9:
-            eligible = False
-            reasons.append(
-                f"Total debt-to-income ratio {back_end_dti:.1f}% exceeds the program's "
-                f"{rules.max_back_end_dti_percent:.1f}% limit."
-            )
-
-        max_monthly_piti_budget = min(
-            applicant.monthly_income * rules.max_front_end_dti_percent / 100,
-            applicant.monthly_income * rules.max_back_end_dti_percent / 100 - applicant.monthly_debts,
+    if lvr > max_lvr + 1e-9:
+        eligible = False
+        min_deposit_percent = 100 - max_lvr
+        reasons.append(
+            f"Deposit of {applicant.deposit_percent:.1f}% is below the minimum "
+            f"{min_deposit_percent:.1f}% required (LVR would be {lvr:.1f}%)."
         )
-        max_monthly_piti_budget = max(max_monthly_piti_budget, 0.0)
-        tax_insurance_rate_monthly = (
-            applicant.annual_property_tax_rate + applicant.annual_insurance_rate
-        ) / 12
-        # Solve for a home price P such that PI(loan=P-down) + P*tax_ins_rate == budget.
-        # Approximate by first estimating a max loan from the full budget, then
-        # correcting for the portion consumed by taxes/insurance on that price.
-        max_loan_estimate = max_loan_for_payment(max_monthly_piti_budget, interest_rate)
-        estimated_price = max_loan_estimate + applicant.down_payment
-        for _ in range(5):
-            piti_budget_for_pi = max_monthly_piti_budget - estimated_price * tax_insurance_rate_monthly
-            piti_budget_for_pi = max(piti_budget_for_pi, 0.0)
-            max_loan_estimate = max_loan_for_payment(piti_budget_for_pi, interest_rate)
-            estimated_price = max_loan_estimate + applicant.down_payment
-        max_affordable_home_price = round(max(estimated_price, 0.0), 2)
 
-    return ProgramResult(
-        program=program,
+    requires_lmi = False
+    estimated_lmi_premium = None
+
+    if scheme == LoanScheme.STANDARD:
+        if lvr > 80.0:
+            requires_lmi = True
+            estimated_lmi_premium = round(estimate_lmi_premium(loan_amount, lvr), 2)
+    else:
+        # Home Guarantee Scheme products waive LMI for eligible borrowers.
+        if scheme != LoanScheme.FAMILY_HOME_GUARANTEE and not applicant.is_first_home_buyer:
+            eligible = False
+            reasons.append("This guarantee requires the applicant to be a first home buyer.")
+        if not applicant.is_owner_occupier:
+            eligible = False
+            reasons.append("The property must be owner-occupied, not an investment.")
+        if not applicant.is_australian_citizen_or_pr:
+            eligible = False
+            reasons.append("Applicant must be an Australian citizen or permanent resident.")
+
+        if scheme == LoanScheme.REGIONAL_FIRST_HOME_GUARANTEE and not applicant.is_regional:
+            eligible = False
+            reasons.append("The Regional First Home Buyer Guarantee requires a regional property.")
+
+        if scheme == LoanScheme.FAMILY_HOME_GUARANTEE:
+            if not applicant.is_single_parent:
+                eligible = False
+                reasons.append("The Family Home Guarantee requires a single parent or legal guardian.")
+            income_cap = FAMILY_HOME_INCOME_CAP
+        else:
+            income_cap = FHBG_INCOME_CAP_COUPLE if applicant.is_couple else FHBG_INCOME_CAP_SINGLE
+
+        if applicant.annual_income > income_cap:
+            eligible = False
+            reasons.append(
+                f"Household income ${applicant.annual_income:,.0f} exceeds the "
+                f"${income_cap:,.0f} cap for this scheme."
+            )
+
+        price_cap = price_cap_for(applicant.state, applicant.is_regional)
+        if applicant.home_price > price_cap:
+            eligible = False
+            region = "regional" if applicant.is_regional else "capital city"
+            reasons.append(
+                f"Property price ${applicant.home_price:,.0f} exceeds the indicative "
+                f"${price_cap:,.0f} cap for {applicant.state} ({region})."
+            )
+
+    # Serviceability: APRA buffer rate applied to the actual proposed loan.
+    assessed_rate = rate + APRA_SERVICEABILITY_BUFFER_PERCENT
+    monthly_repayment = monthly_principal_and_interest(loan_amount, rate)
+    assessed_monthly_repayment = monthly_principal_and_interest(loan_amount, assessed_rate)
+
+    net_monthly_income = estimate_net_monthly_income(applicant.annual_income)
+    available_monthly = net_monthly_income - applicant.monthly_living_expenses - applicant.monthly_other_debts
+    monthly_surplus_at_assessed_rate = available_monthly - assessed_monthly_repayment
+
+    if monthly_surplus_at_assessed_rate < 0:
+        eligible = False
+        reasons.append(
+            f"Estimated repayment at the assessed rate of {assessed_rate:.2f}% "
+            f"(actual rate + {APRA_SERVICEABILITY_BUFFER_PERCENT:.1f}pp APRA buffer) "
+            f"exceeds income after living expenses and other debts by "
+            f"${-monthly_surplus_at_assessed_rate:,.2f}/month."
+        )
+
+    loan_to_income_ratio = loan_amount / applicant.annual_income if applicant.annual_income > 0 else None
+    if loan_to_income_ratio is not None and loan_to_income_ratio > HIGH_LOAN_TO_INCOME_RATIO:
+        reasons.append(
+            f"Loan-to-income ratio of {loan_to_income_ratio:.1f}x exceeds "
+            f"{HIGH_LOAN_TO_INCOME_RATIO:.0f}x gross income; lenders often apply extra "
+            f"scrutiny or caps above this level."
+        )
+
+    max_affordable_loan = max_loan_for_payment(max(available_monthly, 0.0), assessed_rate)
+    max_affordable_home_price = round(max_affordable_loan + applicant.deposit, 2)
+
+    return SchemeResult(
+        scheme=scheme,
         eligible=eligible,
-        needs_verification=needs_verification,
         reasons=reasons,
-        interest_rate_percent=interest_rate,
+        interest_rate_percent=round(rate, 3),
         loan_amount=loan_amount,
-        down_payment_percent=applicant.down_payment_percent,
-        monthly_principal_interest=round(monthly_pi, 2) if monthly_pi is not None else None,
-        monthly_piti=round(monthly_piti, 2) if monthly_piti is not None else None,
-        front_end_dti_percent=round(front_end_dti, 2) if front_end_dti is not None else None,
-        back_end_dti_percent=round(back_end_dti, 2) if back_end_dti is not None else None,
+        lvr_percent=round(lvr, 2),
+        requires_lmi=requires_lmi,
+        estimated_lmi_premium=estimated_lmi_premium,
+        monthly_repayment=round(monthly_repayment, 2),
+        assessed_monthly_repayment=round(assessed_monthly_repayment, 2),
+        monthly_surplus_at_assessed_rate=round(monthly_surplus_at_assessed_rate, 2),
+        loan_to_income_ratio=round(loan_to_income_ratio, 2) if loan_to_income_ratio is not None else None,
         max_affordable_home_price=max_affordable_home_price,
     )
 
 
-def evaluate_all_programs(applicant: Applicant, snapshot: RateSnapshot) -> list[ProgramResult]:
-    return [evaluate_program(applicant, snapshot, program) for program in LoanProgram]
+def evaluate_all_schemes(applicant: Applicant, snapshot: RateSnapshot) -> list[SchemeResult]:
+    return [evaluate_scheme(applicant, snapshot, scheme) for scheme in LoanScheme]
